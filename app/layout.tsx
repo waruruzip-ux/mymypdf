@@ -4,9 +4,13 @@ import './globals.css';
 
 const geistSans = Geist({ variable: '--font-geist-sans', subsets: ['latin'] });
 const geistMono = Geist_Mono({ variable: '--font-geist-mono', subsets: ['latin'] });
+const productionHost = process.env.VERCEL_PROJECT_PRODUCTION_URL;
+const siteUrl = productionHost
+  ? `https://${productionHost}`
+  : 'https://mypdf-editor.waruruzip.chatgpt.site';
 
 export const metadata: Metadata = {
-  metadataBase: new URL('https://mypdf-editor.waruruzip.chatgpt.site'),
+  metadataBase: new URL(siteUrl),
   title: '마이PDF — PDF 여기서 편집해',
   description: 'PDF 병합, 페이지별 분할, 삭제와 추출을 서버 업로드 없이 브라우저에서 처리하세요.',
   alternates: { canonical: '/' },
