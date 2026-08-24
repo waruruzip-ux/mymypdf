@@ -1,20 +1,23 @@
 'use client';
 
-import { ChangeEvent, DragEvent, KeyboardEvent, useMemo, useRef, useState } from 'react';
+import { ChangeEvent, DragEvent, FormEvent, useRef, useState } from 'react';
 import {
-  downloadCombinedPdf,
+  downloadDeletedPdf,
+  downloadExtractedPdf,
+  downloadMergedPdf,
   downloadSplitZip,
-  EditorPage,
   formatBytes,
   inspectPdfFile,
   MAX_TOTAL_BYTES,
   MAX_TOTAL_PAGES,
-  PageSelection,
+  parsePageExpression,
+  parseSplitRanges,
   ProcessingState,
   SourceFile,
 } from './pdf-engine';
 
 type Notice = { tone: 'success' | 'error'; text: string } | null;
+type EditorMode = 'merge' | 'split' | 'extract' | 'delete';
 
 const iconGlyphs = {
   check: '✓',
@@ -23,18 +26,67 @@ const iconGlyphs = {
   file: '▤',
   files: '▥',
   grip: '⋮⋮',
-  left: '‹',
   loading: '◌',
   plus: '+',
   reset: '↻',
-  right: '›',
   scissors: '✂',
   shield: '●',
   split: '▦',
   trash: '−',
+  up: '↑',
+  down: '↓',
   upload: '↑',
   x: '×',
 } as const;
+
+const modeDetails: Record<EditorMode, {
+  label: string;
+  icon: keyof typeof iconGlyphs;
+  title: string;
+  description: string;
+  inputLabel?: string;
+  placeholder?: string;
+  example?: string;
+  button: string;
+}> = {
+  merge: {
+    label: '병합',
+    icon: 'files',
+    title: '파일 순서를 정리하세요',
+    description: '위에서부터 차례대로 하나의 PDF로 합쳐집니다. 파일 카드를 끌어서 순서를 바꿀 수 있어요.',
+    button: '이 순서대로 병합',
+  },
+  split: {
+    label: '분할',
+    icon: 'split',
+    title: '나눌 페이지 범위를 적어주세요',
+    description: '쉼표로 구분한 각 범위가 하나의 PDF가 되어 ZIP으로 저장됩니다.',
+    inputLabel: '나눌 페이지 범위',
+    placeholder: '예: 1-3, 4-6, 7-10',
+    example: '1-3, 4-6처럼 입력하면 두 개의 PDF로 나눠집니다.',
+    button: '분할 ZIP 다운로드',
+  },
+  extract: {
+    label: '추출',
+    icon: 'scissors',
+    title: '필요한 페이지 번호를 적어주세요',
+    description: '입력한 순서대로 페이지만 모아 새 PDF를 만듭니다.',
+    inputLabel: '추출할 페이지',
+    placeholder: '예: 1, 3, 5-7',
+    example: '한 페이지는 3, 여러 페이지는 1, 3, 5-7처럼 입력하세요.',
+    button: '추출 PDF 다운로드',
+  },
+  delete: {
+    label: '삭제',
+    icon: 'trash',
+    title: '빼고 싶은 페이지 번호를 적어주세요',
+    description: '원본은 건드리지 않고, 입력한 페이지를 제외한 새 PDF를 만듭니다.',
+    inputLabel: '삭제할 페이지',
+    placeholder: '예: 2, 4-6',
+    example: '입력한 페이지만 제외됩니다. 최소 한 페이지는 남아 있어야 해요.',
+    button: '삭제 후 PDF 다운로드',
+  },
+};
 
 function UiIcon({ name, className = '' }: { name: keyof typeof iconGlyphs; className?: string }) {
   return <span className={`ui-icon ${className}`} aria-hidden="true">{iconGlyphs[name]}</span>;
@@ -46,23 +98,29 @@ function fileListSize(sources: SourceFile[]) {
   return sources.reduce((total, source) => total + source.size, 0);
 }
 
+function totalPageCount(sources: SourceFile[]) {
+  return sources.reduce((total, source) => total + source.pageCount, 0);
+}
+
 export default function Home() {
   const [sources, setSources] = useState<SourceFile[]>([]);
-  const [pages, setPages] = useState<EditorPage[]>([]);
-  const [selection, setSelection] = useState<PageSelection>(new Set());
+  const [activeMode, setActiveMode] = useState<EditorMode>('merge');
+  const [selectedSourceId, setSelectedSourceId] = useState<string>('');
+  const [pageExpression, setPageExpression] = useState('');
   const [processing, setProcessing] = useState<ProcessingState>(idleProcessing);
   const [notice, setNotice] = useState<Notice>(null);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
-  const [dragOverPageId, setDragOverPageId] = useState<string | null>(null);
+  const [dragOverSourceId, setDragOverSourceId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorFileInputRef = useRef<HTMLInputElement>(null);
-  const draggedPageIdRef = useRef<string | null>(null);
-  const lastSelectedIndexRef = useRef<number | null>(null);
+  const draggedSourceIdRef = useRef<string | null>(null);
 
   const busy = processing.kind !== 'idle';
   const hasWorkspace = sources.length > 0;
-  const selectedPages = useMemo(() => pages.filter((page) => selection.has(page.id)), [pages, selection]);
   const totalBytes = fileListSize(sources);
+  const totalPages = totalPageCount(sources);
+  const selectedSource = sources.find((source) => source.id === selectedSourceId) ?? sources[0];
+  const details = modeDetails[activeMode];
 
   function showNotice(next: Notice) {
     setNotice(next);
@@ -83,26 +141,28 @@ export default function Home() {
     setNotice(null);
     setProcessing({ kind: 'loading', progress: 1, message: 'PDF 파일을 확인하는 중' });
     const pendingSources: SourceFile[] = [];
-    const pendingPages: EditorPage[] = [];
 
     try {
       for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
         const file = files[fileIndex];
-        const remainingPages = MAX_TOTAL_PAGES - pages.length - pendingPages.length;
-        const result = await inspectPdfFile(
+        const pendingPages = totalPageCount(pendingSources);
+        const source = await inspectPdfFile(
           file,
           (fileProgress, message) => {
             const overall = Math.round(((fileIndex + fileProgress / 100) / files.length) * 100);
             setProcessing({ kind: 'loading', progress: overall, message });
           },
-          remainingPages,
+          MAX_TOTAL_PAGES - totalPages - pendingPages,
         );
-        pendingSources.push(result.source);
-        pendingPages.push(...result.pages);
+        pendingSources.push(source);
       }
       setSources((current) => [...current, ...pendingSources]);
-      setPages((current) => [...current, ...pendingPages]);
-      showNotice({ tone: 'success', text: `${pendingPages.length}페이지를 안전하게 불러왔습니다.` });
+      setSelectedSourceId((current) => current || pendingSources[0]?.id || '');
+      const addedPages = totalPageCount(pendingSources);
+      showNotice({
+        tone: 'success',
+        text: `${pendingSources.length}개 파일, ${addedPages}페이지를 안전하게 불러왔습니다.`,
+      });
     } catch (error) {
       showNotice({ tone: 'error', text: error instanceof Error ? error.message : 'PDF를 불러오지 못했습니다.' });
     } finally {
@@ -122,115 +182,98 @@ export default function Home() {
     if (event.dataTransfer.files.length) void addFiles(event.dataTransfer.files);
   }
 
-  function togglePage(index: number, shiftKey: boolean) {
-    const page = pages[index];
-    if (!page) return;
-    setSelection((current) => {
-      const next = new Set(current);
-      if (shiftKey && lastSelectedIndexRef.current !== null) {
-        const start = Math.min(index, lastSelectedIndexRef.current);
-        const end = Math.max(index, lastSelectedIndexRef.current);
-        const shouldSelect = !current.has(page.id);
-        for (let cursor = start; cursor <= end; cursor += 1) {
-          if (shouldSelect) next.add(pages[cursor].id);
-          else next.delete(pages[cursor].id);
-        }
-      } else if (next.has(page.id)) next.delete(page.id);
-      else next.add(page.id);
-      return next;
-    });
-    lastSelectedIndexRef.current = index;
+  function switchMode(mode: EditorMode) {
+    if (busy) return;
+    setActiveMode(mode);
+    setPageExpression('');
+    setNotice(null);
   }
 
-  function handlePageKeyDown(event: KeyboardEvent<HTMLElement>, index: number) {
-    if (event.key === ' ' || event.key === 'Enter') {
-      event.preventDefault();
-      togglePage(index, event.shiftKey);
-    }
-    if (event.altKey && event.key === 'ArrowLeft') {
-      event.preventDefault();
-      movePage(index, -1);
-    }
-    if (event.altKey && event.key === 'ArrowRight') {
-      event.preventDefault();
-      movePage(index, 1);
-    }
-  }
-
-  function movePage(index: number, offset: number) {
+  function moveSource(index: number, offset: number) {
     const destination = index + offset;
-    if (destination < 0 || destination >= pages.length) return;
-    setPages((current) => {
+    if (destination < 0 || destination >= sources.length) return;
+    setSources((current) => {
       const next = [...current];
       [next[index], next[destination]] = [next[destination], next[index]];
       return next;
     });
-    lastSelectedIndexRef.current = null;
   }
 
-  function reorderPage(targetId: string) {
-    const draggedId = draggedPageIdRef.current;
+  function reorderSource(targetId: string) {
+    const draggedId = draggedSourceIdRef.current;
     if (!draggedId || draggedId === targetId) return;
-    setPages((current) => {
-      const fromIndex = current.findIndex((page) => page.id === draggedId);
-      const toIndex = current.findIndex((page) => page.id === targetId);
+    setSources((current) => {
+      const fromIndex = current.findIndex((source) => source.id === draggedId);
+      const toIndex = current.findIndex((source) => source.id === targetId);
       if (fromIndex < 0 || toIndex < 0) return current;
       const next = [...current];
       const [moved] = next.splice(fromIndex, 1);
       next.splice(toIndex, 0, moved);
       return next;
     });
-    lastSelectedIndexRef.current = null;
-    draggedPageIdRef.current = null;
-    setDragOverPageId(null);
+    draggedSourceIdRef.current = null;
+    setDragOverSourceId(null);
   }
 
-  function deleteSelectedPages() {
-    if (!selection.size || busy) return;
-    const count = selection.size;
-    const remaining = pages.filter((page) => !selection.has(page.id));
-    const retainedSources = new Set(remaining.map((page) => page.sourceId));
-    setPages(remaining);
-    setSources((current) => current.filter((source) => retainedSources.has(source.id)));
-    setSelection(new Set());
-    lastSelectedIndexRef.current = null;
-    showNotice({ tone: 'success', text: `${count}페이지를 작업 화면에서 삭제했습니다. 원본은 그대로예요.` });
+  function removeSource(sourceId: string) {
+    if (busy) return;
+    setSources((current) => {
+      const next = current.filter((source) => source.id !== sourceId);
+      if (selectedSourceId === sourceId) setSelectedSourceId(next[0]?.id ?? '');
+      return next;
+    });
+    showNotice({ tone: 'success', text: '작업 목록에서 파일을 뺐습니다. 원본 파일은 그대로예요.' });
   }
 
   function resetWorkspace() {
     if (busy) return;
     setSources([]);
-    setPages([]);
-    setSelection(new Set());
+    setActiveMode('merge');
+    setSelectedSourceId('');
+    setPageExpression('');
     setNotice(null);
-    lastSelectedIndexRef.current = null;
   }
 
-  async function runDownload(kind: 'merge' | 'split' | 'extract') {
+  async function runAction(event?: FormEvent) {
+    event?.preventDefault();
     if (busy) return;
-    const targetPages = kind === 'extract' ? selectedPages : pages;
-    if (!targetPages.length) {
-      showNotice({ tone: 'error', text: kind === 'extract' ? '추출할 페이지를 먼저 선택해 주세요.' : '처리할 페이지가 없습니다.' });
+    if (!sources.length) {
+      showNotice({ tone: 'error', text: '처리할 PDF를 먼저 추가해 주세요.' });
       return;
     }
 
-    const processingKind = kind === 'merge' ? 'merging' : kind === 'split' ? 'splitting' : 'extracting';
-    const startMessage = kind === 'merge' ? 'PDF를 합치는 중' : kind === 'split' ? '페이지를 나누는 중' : '선택 페이지를 추출하는 중';
-    setProcessing({ kind: processingKind, progress: 2, message: startMessage });
+    const processingKind: ProcessingState['kind'] =
+      activeMode === 'merge' ? 'merging' :
+      activeMode === 'split' ? 'splitting' :
+      activeMode === 'extract' ? 'extracting' : 'deleting';
+    const startMessage =
+      activeMode === 'merge' ? '파일 순서대로 합치는 중' :
+      activeMode === 'split' ? '입력한 범위대로 나누는 중' :
+      activeMode === 'extract' ? '입력한 페이지를 추출하는 중' : '입력한 페이지를 제외하는 중';
+
     try {
-      const updateProgress = (progress: number, message: string) => setProcessing({ kind: processingKind, progress, message });
-      if (kind === 'split') {
-        await downloadSplitZip(targetPages, sources, updateProgress);
-      } else {
-        await downloadCombinedPdf(
-          targetPages,
-          sources,
-          kind === 'merge' ? 'merged.pdf' : 'extracted-pages.pdf',
-          kind === 'merge' ? '마이PDF 병합 문서' : '마이PDF 추출 페이지',
-          updateProgress,
-        );
+      let pageIndexes: number[] = [];
+      let splitRanges: ReturnType<typeof parseSplitRanges> = [];
+      if (activeMode !== 'merge') {
+        if (!selectedSource) throw new Error('작업할 PDF를 선택해 주세요.');
+        if (activeMode === 'split') splitRanges = parseSplitRanges(pageExpression, selectedSource.pageCount);
+        else pageIndexes = parsePageExpression(pageExpression, selectedSource.pageCount);
       }
-      showNotice({ tone: 'success', text: kind === 'merge' ? '병합 PDF를 다운로드했습니다.' : kind === 'split' ? '분할 ZIP을 다운로드했습니다.' : '선택 페이지 PDF를 다운로드했습니다.' });
+
+      setProcessing({ kind: processingKind, progress: 2, message: startMessage });
+      const updateProgress = (progress: number, message: string) =>
+        setProcessing({ kind: processingKind, progress, message });
+
+      if (activeMode === 'merge') await downloadMergedPdf(sources, updateProgress);
+      else if (activeMode === 'split') await downloadSplitZip(selectedSource, splitRanges, updateProgress);
+      else if (activeMode === 'extract') await downloadExtractedPdf(selectedSource, pageIndexes, updateProgress);
+      else await downloadDeletedPdf(selectedSource, pageIndexes, updateProgress);
+
+      const successText =
+        activeMode === 'merge' ? '병합 PDF를 다운로드했습니다.' :
+        activeMode === 'split' ? '분할 ZIP을 다운로드했습니다.' :
+        activeMode === 'extract' ? '추출 PDF를 다운로드했습니다.' : '페이지를 제외한 새 PDF를 다운로드했습니다.';
+      showNotice({ tone: 'success', text: successText });
     } catch (error) {
       showNotice({ tone: 'error', text: error instanceof Error ? error.message : '파일을 만드는 중 문제가 발생했습니다.' });
     } finally {
@@ -239,9 +282,14 @@ export default function Home() {
   }
 
   const fileDropProps = {
-    onDragEnter: (event: DragEvent<HTMLElement>) => { event.preventDefault(); if (!busy) setIsDraggingFiles(true); },
+    onDragEnter: (event: DragEvent<HTMLElement>) => {
+      event.preventDefault();
+      if (!busy && event.dataTransfer.types.includes('Files')) setIsDraggingFiles(true);
+    },
     onDragOver: (event: DragEvent<HTMLElement>) => event.preventDefault(),
-    onDragLeave: (event: DragEvent<HTMLElement>) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setIsDraggingFiles(false); },
+    onDragLeave: (event: DragEvent<HTMLElement>) => {
+      if (!event.currentTarget.contains(event.relatedTarget as Node)) setIsDraggingFiles(false);
+    },
     onDrop: handleFileDrop,
   };
 
@@ -255,7 +303,7 @@ export default function Home() {
         {hasWorkspace ? (
           <div className="header-stats" aria-label="현재 작업 정보">
             <span><UiIcon name="files" /> {sources.length}개 파일</span>
-            <span><UiIcon name="file" /> {pages.length}페이지</span>
+            <span><UiIcon name="file" /> {totalPages}페이지</span>
             <span>{formatBytes(totalBytes)}</span>
           </div>
         ) : (
@@ -289,7 +337,7 @@ export default function Home() {
           <div className="feature-strip" aria-label="지원 기능">
             <span><UiIcon name="files" /> PDF 병합</span>
             <span><UiIcon name="extract" /> 페이지 추출</span>
-            <span><UiIcon name="split" /> 페이지별 분할</span>
+            <span><UiIcon name="split" /> 범위별 분할</span>
             <span><UiIcon name="trash" /> 페이지 삭제</span>
           </div>
         </section>
@@ -298,8 +346,8 @@ export default function Home() {
           <div className="editor-heading">
             <div>
               <p className="editor-kicker"><UiIcon name="shield" /> 모든 작업은 이 기기에서만 처리됩니다</p>
-              <h1>페이지를 원하는 순서로 정리하세요</h1>
-              <p>페이지를 선택하거나 끌어서 옮긴 뒤, 원하는 작업을 실행하세요.</p>
+              <h1>어떤 작업을 할까요?</h1>
+              <p>병합은 파일 순서만 정하고, 나머지는 페이지 번호만 입력하면 됩니다.</p>
             </div>
             <div className="editor-heading-actions">
               <button className="secondary-button" type="button" disabled={busy} onClick={() => editorFileInputRef.current?.click()}><UiIcon name="plus" /> 파일 추가</button>
@@ -308,21 +356,21 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="action-toolbar" aria-label="PDF 편집 작업">
-            <div className="selection-summary">
-              <strong>{selection.size ? `${selection.size}페이지 선택됨` : `전체 ${pages.length}페이지`}</strong>
-              <button type="button" onClick={() => setSelection(selection.size === pages.length ? new Set() : new Set(pages.map((page) => page.id)))} disabled={busy || !pages.length}>
-                {selection.size === pages.length && pages.length ? '선택 해제' : '전체 선택'}
+          <nav className="mode-tabs" aria-label="PDF 작업 선택">
+            {(Object.keys(modeDetails) as EditorMode[]).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                className={activeMode === mode ? 'active' : ''}
+                aria-pressed={activeMode === mode}
+                disabled={busy}
+                onClick={() => switchMode(mode)}
+              >
+                <UiIcon name={modeDetails[mode].icon} />
+                <span>{modeDetails[mode].label}</span>
               </button>
-            </div>
-            <div className="toolbar-actions">
-              <button className="tool-button" type="button" disabled={busy || !pages.length} onClick={() => void runDownload('merge')}><UiIcon name="files" /> 병합</button>
-              <button className="tool-button" type="button" disabled={busy || !pages.length} onClick={() => void runDownload('split')}><UiIcon name="split" /> 분할</button>
-              <button className="tool-button" type="button" disabled={busy || !selection.size} onClick={() => void runDownload('extract')}><UiIcon name="scissors" /> 추출</button>
-              <button className="tool-button danger" type="button" disabled={busy || !selection.size} onClick={deleteSelectedPages}><UiIcon name="trash" /> 삭제</button>
-              <button className="download-button" type="button" disabled={busy || !pages.length} onClick={() => void runDownload('merge')}><UiIcon name="download" /> PDF 저장</button>
-            </div>
-          </div>
+            ))}
+          </nav>
 
           {busy && (
             <div className="workspace-progress" role="status" aria-live="polite">
@@ -333,61 +381,119 @@ export default function Home() {
             </div>
           )}
 
-          <div className={`page-grid ${isDraggingFiles ? 'receiving-files' : ''}`} aria-label="PDF 페이지 목록">
-            {pages.map((page, index) => {
-              const selected = selection.has(page.id);
-              return (
-                <article
-                  className={`page-card ${selected ? 'is-selected' : ''} ${dragOverPageId === page.id ? 'is-drag-over' : ''}`}
-                  key={page.id}
-                  role="checkbox"
-                  aria-checked={selected}
-                  aria-label={`${page.sourceName} ${page.originalPageNumber}페이지${selected ? ', 선택됨' : ''}`}
-                  tabIndex={0}
-                  draggable={!busy}
-                  onClick={(event) => togglePage(index, event.shiftKey)}
-                  onKeyDown={(event) => handlePageKeyDown(event, index)}
-                  onDragStart={(event) => { draggedPageIdRef.current = page.id; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', page.id); }}
-                  onDragEnter={(event) => { event.preventDefault(); if (draggedPageIdRef.current) setDragOverPageId(page.id); }}
-                  onDragOver={(event) => { if (draggedPageIdRef.current) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; } }}
-                  onDrop={(event) => { if (draggedPageIdRef.current) { event.preventDefault(); event.stopPropagation(); reorderPage(page.id); } }}
-                  onDragEnd={() => { draggedPageIdRef.current = null; setDragOverPageId(null); }}
-                >
-                  <div className="page-card-top">
-                    <span className="page-order">{index + 1}</span>
-                    <span className="selection-check" aria-hidden="true">{selected ? <UiIcon name="check" /> : null}</span>
-                  </div>
-                  <div className="page-preview" style={{ aspectRatio: `${page.width} / ${page.height}` }}>
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={page.thumbnail} alt="" draggable={false} />
-                  </div>
-                  <div className="page-info">
-                    <div><strong title={page.sourceName}>{page.sourceName}</strong><span>원본 {page.originalPageNumber}페이지 · {page.rotation}°</span></div>
-                    <UiIcon name="grip" className="drag-handle" />
-                  </div>
-                  <div className="page-move-controls" aria-label="페이지 순서 변경">
-                    <button type="button" disabled={busy || index === 0} aria-label="한 칸 앞으로 이동" onClick={(event) => { event.stopPropagation(); movePage(index, -1); }}><UiIcon name="left" /></button>
-                    <button type="button" disabled={busy || index === pages.length - 1} aria-label="한 칸 뒤로 이동" onClick={(event) => { event.stopPropagation(); movePage(index, 1); }}><UiIcon name="right" /></button>
-                  </div>
-                </article>
-              );
-            })}
-          </div>
+          <section className="operation-panel" aria-labelledby="operation-title">
+            <div className="operation-copy">
+              <span className="operation-icon"><UiIcon name={details.icon} /></span>
+              <div>
+                <p>{details.label} 작업</p>
+                <h2 id="operation-title">{details.title}</h2>
+                <span>{details.description}</span>
+              </div>
+            </div>
+
+            {activeMode === 'merge' ? (
+              <div className="merge-workspace">
+                <ol className="file-order-list" aria-label="병합할 PDF 순서">
+                  {sources.map((source, index) => (
+                    <li
+                      key={source.id}
+                      className={`file-row ${dragOverSourceId === source.id ? 'is-drag-over' : ''}`}
+                      draggable={!busy}
+                      onDragStart={(event) => {
+                        draggedSourceIdRef.current = source.id;
+                        event.dataTransfer.effectAllowed = 'move';
+                        event.dataTransfer.setData('text/plain', source.id);
+                      }}
+                      onDragEnter={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        if (draggedSourceIdRef.current) setDragOverSourceId(source.id);
+                      }}
+                      onDragOver={(event) => {
+                        if (draggedSourceIdRef.current) {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          event.dataTransfer.dropEffect = 'move';
+                        }
+                      }}
+                      onDrop={(event) => {
+                        if (draggedSourceIdRef.current) {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          reorderSource(source.id);
+                        }
+                      }}
+                      onDragEnd={() => {
+                        draggedSourceIdRef.current = null;
+                        setDragOverSourceId(null);
+                      }}
+                    >
+                      <span className="file-index">{index + 1}</span>
+                      <span className="file-document-icon"><UiIcon name="file" /></span>
+                      <span className="file-meta">
+                        <strong title={source.name}>{source.name}</strong>
+                        <small>{source.pageCount}페이지 · {formatBytes(source.size)}</small>
+                      </span>
+                      <UiIcon name="grip" className="file-drag-handle" />
+                      <span className="file-order-controls" aria-label={`${source.name} 순서 변경`}>
+                        <button type="button" disabled={busy || index === 0} aria-label="한 칸 위로" onClick={() => moveSource(index, -1)}><UiIcon name="up" /></button>
+                        <button type="button" disabled={busy || index === sources.length - 1} aria-label="한 칸 아래로" onClick={() => moveSource(index, 1)}><UiIcon name="down" /></button>
+                        <button className="remove-file" type="button" disabled={busy} aria-label={`${source.name} 빼기`} onClick={() => removeSource(source.id)}><UiIcon name="x" /></button>
+                      </span>
+                    </li>
+                  ))}
+                </ol>
+                <div className="operation-footer">
+                  <p><strong>{sources.length}개 파일</strong> · 총 {totalPages}페이지</p>
+                  <button className="download-button" type="button" disabled={busy || !sources.length} onClick={() => void runAction()}><UiIcon name="download" /> {details.button}</button>
+                </div>
+              </div>
+            ) : (
+              <form className="range-form" onSubmit={(event) => void runAction(event)}>
+                <label className="field-group">
+                  <span>작업할 PDF</span>
+                  <span className="select-wrap">
+                    <select
+                      value={selectedSource?.id ?? ''}
+                      onChange={(event) => {
+                        setSelectedSourceId(event.target.value);
+                        setPageExpression('');
+                      }}
+                      disabled={busy}
+                    >
+                      {sources.map((source) => <option key={source.id} value={source.id}>{source.name} ({source.pageCount}페이지)</option>)}
+                    </select>
+                  </span>
+                </label>
+                <label className="field-group">
+                  <span>{details.inputLabel}</span>
+                  <input
+                    className="page-expression"
+                    type="text"
+                    inputMode="text"
+                    autoComplete="off"
+                    value={pageExpression}
+                    placeholder={details.placeholder}
+                    disabled={busy}
+                    aria-describedby="page-expression-help"
+                    onChange={(event) => setPageExpression(event.target.value)}
+                  />
+                </label>
+                <p className="input-help" id="page-expression-help"><UiIcon name="check" /> {details.example}</p>
+                <div className="selected-document-summary">
+                  <span className="file-document-icon"><UiIcon name="file" /></span>
+                  <span><strong>{selectedSource?.name}</strong><small>입력 가능 범위: 1-{selectedSource?.pageCount}페이지</small></span>
+                </div>
+                <button className="download-button range-submit" type="submit" disabled={busy || !pageExpression.trim()}><UiIcon name="download" /> {details.button}</button>
+              </form>
+            )}
+          </section>
 
           <div className={`drop-overlay ${isDraggingFiles ? 'visible' : ''}`} aria-hidden="true"><UiIcon name="upload" /><strong>PDF를 놓아 추가하세요</strong></div>
         </section>
       )}
 
       {!hasWorkspace && <footer><p><strong>마이PDF</strong>는 파일을 서버에 저장하거나 전송하지 않습니다.</p><p>© 2026 마이PDF</p></footer>}
-
-      {hasWorkspace && (
-        <nav className="mobile-action-bar" aria-label="모바일 PDF 작업">
-          <button type="button" disabled={busy || !pages.length} onClick={() => void runDownload('merge')}><UiIcon name="files" /><span>병합</span></button>
-          <button type="button" disabled={busy || !pages.length} onClick={() => void runDownload('split')}><UiIcon name="split" /><span>분할</span></button>
-          <button type="button" disabled={busy || !selection.size} onClick={() => void runDownload('extract')}><UiIcon name="scissors" /><span>추출</span></button>
-          <button className="danger" type="button" disabled={busy || !selection.size} onClick={deleteSelectedPages}><UiIcon name="trash" /><span>삭제</span></button>
-        </nav>
-      )}
 
       {notice && (
         <div className={`notice ${notice.tone}`} role="status" aria-live="polite">
