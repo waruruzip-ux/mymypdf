@@ -269,13 +269,13 @@ export default function Home() {
           <div className="hero-glow hero-glow-right" aria-hidden="true" />
           <div className="hero-copy">
             <p className="eyebrow"><span /> 100% 브라우저 처리</p>
-            <h1>내 PDF, 내 기기에서<br />안전하게 편집하세요</h1>
+            <h1>PDF 여기서 편집해</h1>
             <p className="hero-description">합치고, 나누고, 필요한 페이지만 골라보세요.<br className="desktop-break" /> 업로드 없이 빠르고 간편하게 처리됩니다.</p>
           </div>
 
           <section className={`upload-card ${isDraggingFiles ? 'is-dragging' : ''}`} aria-labelledby="upload-title">
             <div className="upload-icon" aria-hidden="true">{busy ? <UiIcon name="loading" className="spin" /> : <UiIcon name="upload" />}</div>
-            <h2 id="upload-title">{isDraggingFiles ? '여기에 놓으면 바로 시작해요' : 'PDF 파일을 여기에 놓으세요'}</h2>
+            <h2 id="upload-title">{isDraggingFiles ? '여기에 놓으면 바로 시작해요' : 'PDF 파일 여따 넣어'}</h2>
             <p>{busy ? processing.message : '여러 파일을 한 번에 선택할 수 있어요'}</p>
             {busy ? (
               <div className="inline-progress" aria-label={`진행률 ${processing.progress}%`}><span style={{ width: `${processing.progress}%` }} /></div>

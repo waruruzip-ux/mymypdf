@@ -7,21 +7,21 @@ const geistMono = Geist_Mono({ variable: '--font-geist-mono', subsets: ['latin']
 
 export const metadata: Metadata = {
   metadataBase: new URL('https://mypdf-editor.waruruzip.chatgpt.site'),
-  title: '마이PDF — 내 기기에서 안전하게 PDF 편집',
+  title: '마이PDF — PDF 여기서 편집해',
   description: 'PDF 병합, 페이지별 분할, 삭제와 추출을 서버 업로드 없이 브라우저에서 처리하세요.',
   alternates: { canonical: '/' },
   openGraph: {
-    title: '마이PDF — 내 기기에서 안전하게 PDF 편집',
+    title: '마이PDF — PDF 여기서 편집해',
     description: 'PDF 병합, 페이지별 분할, 삭제와 추출을 서버 업로드 없이 브라우저에서 처리하세요.',
     siteName: '마이PDF',
     type: 'website',
     locale: 'ko_KR',
     url: '/',
-    images: [{ url: '/og.png', width: 1200, height: 630, alt: '마이PDF — 내 PDF, 내 기기에서 안전하게 편집하세요' }],
+    images: [{ url: '/og.png', width: 1200, height: 630, alt: '마이PDF — PDF 여기서 편집해' }],
   },
   twitter: {
     card: 'summary_large_image',
-    title: '마이PDF — 내 기기에서 안전하게 PDF 편집',
+    title: '마이PDF — PDF 여기서 편집해',
     description: 'PDF 병합, 페이지별 분할, 삭제와 추출을 서버 업로드 없이 브라우저에서 처리하세요.',
     images: ['/og.png'],
   },
