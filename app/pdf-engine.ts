@@ -27,6 +27,11 @@ export interface PageThumbnail {
   dataUrl: string;
 }
 
+export interface PageRange {
+  startIndex: number;
+  endIndex: number;
+}
+
 interface PageReference {
   sourceId: string;
   sourceName: string;
@@ -272,25 +277,31 @@ export async function downloadDeletedPdf(
 
 export async function downloadSplitZip(
   source: SourceFile,
-  pageIndexes: number[],
+  ranges: PageRange[],
   onProgress: ProgressHandler,
 ) {
-  if (!pageIndexes.length) throw new Error('분할할 페이지를 선택해 주세요.');
+  if (!ranges.length) throw new Error('분할할 구간을 지정해 주세요.');
   const zip = new JSZip();
-  for (let index = 0; index < pageIndexes.length; index += 1) {
-    const pageIndex = pageIndexes[index];
+  const baseName = cleanBaseName(source.name);
+  for (let index = 0; index < ranges.length; index += 1) {
+    const range = ranges[index];
+    const pageIndexes = Array.from(
+      { length: range.endIndex - range.startIndex + 1 },
+      (_, offset) => range.startIndex + offset,
+    );
     const bytes = await buildPdf(
-      referencesFor(source, [pageIndex]),
+      referencesFor(source, pageIndexes),
       [source],
-      `${source.name} ${pageIndex + 1}페이지`,
+      `${source.name} ${range.startIndex + 1}-${range.endIndex + 1}페이지`,
       () => undefined,
     );
     const order = String(index + 1).padStart(3, '0');
-    const original = String(pageIndex + 1).padStart(3, '0');
-    zip.file(`${order}-${cleanBaseName(source.name)}-p${original}.pdf`, bytes);
+    const start = String(range.startIndex + 1).padStart(3, '0');
+    const end = String(range.endIndex + 1).padStart(3, '0');
+    zip.file(`${order}-${baseName}-p${start}-${end}.pdf`, bytes);
     onProgress(
-      Math.round(((index + 1) / pageIndexes.length) * 82),
-      `${index + 1}/${pageIndexes.length}개 PDF 만드는 중`,
+      Math.round(((index + 1) / ranges.length) * 82),
+      `${index + 1}/${ranges.length}개 구간 PDF 만드는 중`,
     );
   }
   const blob = await zip.generateAsync(

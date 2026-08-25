@@ -12,11 +12,11 @@ const siteUrl = productionHost
 export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),
   title: '마이PDF — PDF 여기서 편집해',
-  description: 'PDF 병합, 페이지별 분할, 삭제와 추출을 서버 업로드 없이 브라우저에서 처리하세요.',
+  description: 'PDF 병합, 구간 분할, 삭제와 추출을 서버 업로드 없이 브라우저에서 처리하세요.',
   alternates: { canonical: '/' },
   openGraph: {
     title: '마이PDF — PDF 여기서 편집해',
-    description: 'PDF 병합, 페이지별 분할, 삭제와 추출을 서버 업로드 없이 브라우저에서 처리하세요.',
+    description: 'PDF 병합, 구간 분할, 삭제와 추출을 서버 업로드 없이 브라우저에서 처리하세요.',
     siteName: '마이PDF',
     type: 'website',
     locale: 'ko_KR',
@@ -26,7 +26,7 @@ export const metadata: Metadata = {
   twitter: {
     card: 'summary_large_image',
     title: '마이PDF — PDF 여기서 편집해',
-    description: 'PDF 병합, 페이지별 분할, 삭제와 추출을 서버 업로드 없이 브라우저에서 처리하세요.',
+    description: 'PDF 병합, 구간 분할, 삭제와 추출을 서버 업로드 없이 브라우저에서 처리하세요.',
     images: ['/og.png'],
   },
 };

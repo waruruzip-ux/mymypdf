@@ -1,6 +1,6 @@
 'use client';
 
-import { ChangeEvent, DragEvent, KeyboardEvent, useRef, useState } from 'react';
+import { ChangeEvent, DragEvent, KeyboardEvent, PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from 'react';
 import {
   downloadDeletedPdf,
   downloadExtractedPdf,
@@ -10,6 +10,7 @@ import {
   inspectPdfFile,
   MAX_TOTAL_BYTES,
   MAX_TOTAL_PAGES,
+  PageRange,
   PageThumbnail,
   ProcessingState,
   renderPdfThumbnails,
@@ -56,9 +57,9 @@ const modeDetails: Record<EditorMode, {
   split: {
     label: '분할',
     icon: 'split',
-    title: '나눌 페이지를 골라주세요',
-    description: '선택한 페이지를 각각 한 장짜리 PDF로 만들어 ZIP으로 저장합니다.',
-    button: '선택 페이지 분할',
+    title: '나눌 구간을 드래그하세요',
+    description: '시작 페이지에서 끝 페이지까지 드래그하면 그 범위가 하나의 PDF가 됩니다.',
+    button: '구간 PDF ZIP 받기',
   },
   extract: {
     label: '추출',
@@ -82,6 +83,40 @@ function UiIcon({ name, className = '' }: { name: keyof typeof iconGlyphs; class
 
 const idleProcessing: ProcessingState = { kind: 'idle', progress: 0, message: '' };
 
+type DragSelectionSession = {
+  pointerId: number;
+  pointerType: string;
+  startDisplayIndex: number;
+  currentDisplayIndex: number;
+  startX: number;
+  startY: number;
+  lastY: number;
+  active: boolean;
+  moved: boolean;
+  scrolling: boolean;
+  selecting: boolean;
+  captureTarget: HTMLElement;
+};
+
+function normalizeRange(startIndex: number, endIndex: number): PageRange {
+  return {
+    startIndex: Math.min(startIndex, endIndex),
+    endIndex: Math.max(startIndex, endIndex),
+  };
+}
+
+function rangeContains(range: PageRange | null, pageIndex: number) {
+  return Boolean(range && pageIndex >= range.startIndex && pageIndex <= range.endIndex);
+}
+
+function rangePageCount(range: PageRange) {
+  return range.endIndex - range.startIndex + 1;
+}
+
+function rangesOverlap(first: PageRange, second: PageRange) {
+  return first.startIndex <= second.endIndex && second.startIndex <= first.endIndex;
+}
+
 function fileListSize(sources: SourceFile[]) {
   return sources.reduce((total, source) => total + source.size, 0);
 }
@@ -96,6 +131,9 @@ export default function Home() {
   const [selectedSourceId, setSelectedSourceId] = useState<string>('');
   const [thumbnails, setThumbnails] = useState<PageThumbnail[]>([]);
   const [selectedPageIndexes, setSelectedPageIndexes] = useState<Set<number>>(new Set());
+  const [splitRanges, setSplitRanges] = useState<PageRange[]>([]);
+  const [draftRange, setDraftRange] = useState<PageRange | null>(null);
+  const [draftSelecting, setDraftSelecting] = useState(true);
   const [processing, setProcessing] = useState<ProcessingState>(idleProcessing);
   const [notice, setNotice] = useState<Notice>(null);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
@@ -104,6 +142,11 @@ export default function Home() {
   const editorFileInputRef = useRef<HTMLInputElement>(null);
   const draggedSourceIdRef = useRef<string | null>(null);
   const lastSelectedIndexRef = useRef<number | null>(null);
+  const dragSelectionRef = useRef<DragSelectionSession | null>(null);
+  const longPressTimerRef = useRef<number | null>(null);
+  const autoScrollFrameRef = useRef<number | null>(null);
+  const dragPointerRef = useRef({ x: 0, y: 0 });
+  const suppressClickRef = useRef(false);
   const thumbnailCacheRef = useRef(new Map<string, PageThumbnail[]>());
   const thumbnailPromiseCacheRef = useRef(new Map<string, Promise<PageThumbnail[]>>());
 
@@ -113,9 +156,12 @@ export default function Home() {
   const totalPages = totalPageCount(sources);
   const selectedSource = sources.find((source) => source.id === selectedSourceId) ?? sources[0];
   const details = modeDetails[activeMode];
+  const splitPageCount = splitRanges.reduce((total, range) => total + rangePageCount(range), 0);
 
   async function prepareThumbnails(source: SourceFile) {
     setSelectedPageIndexes(new Set());
+    setSplitRanges([]);
+    setDraftRange(null);
     lastSelectedIndexRef.current = null;
     const cached = thumbnailCacheRef.current.get(source.id);
     if (cached) {
@@ -212,6 +258,8 @@ export default function Home() {
     if (busy) return;
     setActiveMode(mode);
     setSelectedPageIndexes(new Set());
+    setSplitRanges([]);
+    setDraftRange(null);
     lastSelectedIndexRef.current = null;
     setNotice(null);
     if (mode === 'merge') setThumbnails([]);
@@ -252,6 +300,8 @@ export default function Home() {
     setSources(next);
     if (selectedSource?.id === sourceId) {
       setSelectedPageIndexes(new Set());
+      setSplitRanges([]);
+      setDraftRange(null);
       setThumbnails([]);
       setSelectedSourceId(next[0]?.id ?? '');
       if (activeMode !== 'merge' && next[0]) void prepareThumbnails(next[0]);
@@ -266,6 +316,8 @@ export default function Home() {
     setSelectedSourceId('');
     setThumbnails([]);
     setSelectedPageIndexes(new Set());
+    setSplitRanges([]);
+    setDraftRange(null);
     thumbnailCacheRef.current.clear();
     thumbnailPromiseCacheRef.current.clear();
     lastSelectedIndexRef.current = null;
@@ -309,6 +361,205 @@ export default function Home() {
     lastSelectedIndexRef.current = null;
   }
 
+  function addSplitRange(range: PageRange) {
+    const normalized = normalizeRange(range.startIndex, range.endIndex);
+    if (splitRanges.some((current) => rangesOverlap(current, normalized))) {
+      showNotice({ tone: 'error', text: '이미 지정한 구간과 겹칩니다. 겹치지 않게 다시 드래그해 주세요.' });
+      return;
+    }
+    setSplitRanges((current) => [...current, normalized].sort((a, b) => a.startIndex - b.startIndex));
+    setSelectedPageIndexes(new Set());
+    lastSelectedIndexRef.current = null;
+  }
+
+  function addSelectedAsSplitRange() {
+    const indexes = [...selectedPageIndexes].sort((a, b) => a - b);
+    if (!indexes.length) {
+      showNotice({ tone: 'error', text: '추가할 시작·끝 페이지를 먼저 선택해 주세요.' });
+      return;
+    }
+    const range = normalizeRange(indexes[0], indexes[indexes.length - 1]);
+    if (rangePageCount(range) !== indexes.length) {
+      showNotice({ tone: 'error', text: '분할 구간은 중간에 빠진 페이지 없이 연속으로 선택해 주세요.' });
+      return;
+    }
+    addSplitRange(range);
+  }
+
+  function applyDraggedPageSelection(range: PageRange, selecting: boolean) {
+    setSelectedPageIndexes((current) => {
+      const next = new Set(current);
+      for (let pageIndex = range.startIndex; pageIndex <= range.endIndex; pageIndex += 1) {
+        if (selecting) next.add(pageIndex);
+        else next.delete(pageIndex);
+      }
+      return next;
+    });
+    lastSelectedIndexRef.current = null;
+  }
+
+  function clearLongPressTimer() {
+    if (longPressTimerRef.current !== null) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }
+
+  function stopAutoScroll() {
+    if (autoScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(autoScrollFrameRef.current);
+      autoScrollFrameRef.current = null;
+    }
+  }
+
+  function updateDragTargetAtPoint(clientX: number, clientY: number) {
+    const session = dragSelectionRef.current;
+    if (!session?.active) return;
+    const pointed = document.elementFromPoint(clientX, clientY)?.closest<HTMLElement>('[data-page-display-index]');
+    if (!pointed) return;
+    const displayIndex = Number(pointed.dataset.pageDisplayIndex);
+    if (!Number.isInteger(displayIndex) || !thumbnails[displayIndex] || displayIndex === session.currentDisplayIndex) return;
+    session.currentDisplayIndex = displayIndex;
+    setDraftRange(normalizeRange(
+      thumbnails[session.startDisplayIndex].pageIndex,
+      thumbnails[displayIndex].pageIndex,
+    ));
+  }
+
+  function startAutoScroll() {
+    if (autoScrollFrameRef.current !== null) return;
+    const step = () => {
+      const session = dragSelectionRef.current;
+      if (!session?.active) {
+        autoScrollFrameRef.current = null;
+        return;
+      }
+      const { x, y } = dragPointerRef.current;
+      const topEdge = 110;
+      const bottomEdge = window.innerHeight - 120;
+      let velocity = 0;
+      if (y < topEdge) velocity = -Math.min(18, Math.max(4, (topEdge - y) / 4));
+      else if (y > bottomEdge) velocity = Math.min(18, Math.max(4, (y - bottomEdge) / 4));
+      if (velocity) {
+        window.scrollBy(0, velocity);
+        updateDragTargetAtPoint(x, Math.min(bottomEdge, Math.max(topEdge, y)));
+      }
+      autoScrollFrameRef.current = window.requestAnimationFrame(step);
+    };
+    autoScrollFrameRef.current = window.requestAnimationFrame(step);
+  }
+
+  function handlePagePointerDown(event: ReactPointerEvent<HTMLElement>, displayIndex: number) {
+    if (busy || event.button !== 0 || !thumbnails[displayIndex]) return;
+    const pageIndex = thumbnails[displayIndex].pageIndex;
+    const isTouch = event.pointerType === 'touch';
+    const session: DragSelectionSession = {
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+      startDisplayIndex: displayIndex,
+      currentDisplayIndex: displayIndex,
+      startX: event.clientX,
+      startY: event.clientY,
+      lastY: event.clientY,
+      active: !isTouch,
+      moved: false,
+      scrolling: false,
+      selecting: activeMode === 'split' || !selectedPageIndexes.has(pageIndex),
+      captureTarget: event.currentTarget,
+    };
+    dragSelectionRef.current = session;
+    dragPointerRef.current = { x: event.clientX, y: event.clientY };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    if (session.active) {
+      setDraftSelecting(session.selecting);
+      setDraftRange({ startIndex: pageIndex, endIndex: pageIndex });
+      return;
+    }
+    clearLongPressTimer();
+    longPressTimerRef.current = window.setTimeout(() => {
+      const current = dragSelectionRef.current;
+      if (!current || current.pointerId !== event.pointerId || current.scrolling) return;
+      current.active = true;
+      setDraftSelecting(current.selecting);
+      setDraftRange({ startIndex: pageIndex, endIndex: pageIndex });
+      startAutoScroll();
+    }, 320);
+  }
+
+  function handlePagePointerMove(event: ReactPointerEvent<HTMLElement>) {
+    const session = dragSelectionRef.current;
+    if (!session || session.pointerId !== event.pointerId) return;
+    dragPointerRef.current = { x: event.clientX, y: event.clientY };
+    const distance = Math.hypot(event.clientX - session.startX, event.clientY - session.startY);
+    if (session.pointerType === 'touch' && !session.active) {
+      if (distance > 7) {
+        session.scrolling = true;
+        clearLongPressTimer();
+        window.scrollBy(0, session.lastY - event.clientY);
+        session.lastY = event.clientY;
+        suppressClickRef.current = true;
+        event.preventDefault();
+      }
+      return;
+    }
+    if (!session.active) return;
+    if (distance > 4) session.moved = true;
+    if (!session.moved) return;
+    event.preventDefault();
+    updateDragTargetAtPoint(event.clientX, event.clientY);
+    startAutoScroll();
+  }
+
+  function finishPagePointer(pointerId: number, cancelled = false) {
+    const session = dragSelectionRef.current;
+    if (!session || session.pointerId !== pointerId) return;
+    clearLongPressTimer();
+    stopAutoScroll();
+    const shouldCommit = !cancelled && session.active && session.moved;
+    const range = normalizeRange(
+      thumbnails[session.startDisplayIndex]?.pageIndex ?? 0,
+      thumbnails[session.currentDisplayIndex]?.pageIndex ?? 0,
+    );
+    if (session.captureTarget.hasPointerCapture(session.pointerId)) {
+      session.captureTarget.releasePointerCapture(session.pointerId);
+    }
+    dragSelectionRef.current = null;
+    setDraftRange(null);
+    if (shouldCommit) {
+      if (activeMode === 'split') addSplitRange(range);
+      else applyDraggedPageSelection(range, session.selecting);
+      suppressClickRef.current = true;
+    }
+    if (session.scrolling || shouldCommit) {
+      window.setTimeout(() => {
+        suppressClickRef.current = false;
+      }, 0);
+    }
+  }
+
+  useEffect(() => {
+    const handlePointerUp = (event: PointerEvent) => finishPagePointer(event.pointerId);
+    const handlePointerCancel = (event: PointerEvent) => finishPagePointer(event.pointerId, true);
+    const handleMouseUp = () => {
+      const pointerId = dragSelectionRef.current?.pointerId;
+      if (pointerId !== undefined) finishPagePointer(pointerId);
+    };
+    const handleWindowBlur = () => {
+      const pointerId = dragSelectionRef.current?.pointerId;
+      if (pointerId !== undefined) finishPagePointer(pointerId, true);
+    };
+    window.addEventListener('pointerup', handlePointerUp);
+    window.addEventListener('pointercancel', handlePointerCancel);
+    window.addEventListener('mouseup', handleMouseUp);
+    window.addEventListener('blur', handleWindowBlur);
+    return () => {
+      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerCancel);
+      window.removeEventListener('mouseup', handleMouseUp);
+      window.removeEventListener('blur', handleWindowBlur);
+    };
+  });
+
   async function runAction() {
     if (busy) return;
     if (!sources.length) {
@@ -317,7 +568,11 @@ export default function Home() {
     }
 
     const pageIndexes = [...selectedPageIndexes].sort((a, b) => a - b);
-    if (activeMode !== 'merge' && !pageIndexes.length) {
+    if (activeMode === 'split' && !splitRanges.length) {
+      showNotice({ tone: 'error', text: '분할할 구간을 먼저 드래그해 주세요.' });
+      return;
+    }
+    if ((activeMode === 'extract' || activeMode === 'delete') && !pageIndexes.length) {
       showNotice({ tone: 'error', text: `${details.label}할 페이지를 먼저 선택해 주세요.` });
       return;
     }
@@ -328,7 +583,7 @@ export default function Home() {
       activeMode === 'extract' ? 'extracting' : 'deleting';
     const startMessage =
       activeMode === 'merge' ? '파일 순서대로 합치는 중' :
-      activeMode === 'split' ? '선택한 페이지를 나누는 중' :
+      activeMode === 'split' ? '지정한 구간을 나누는 중' :
       activeMode === 'extract' ? '선택한 페이지를 추출하는 중' : '선택한 페이지를 제외하는 중';
 
     try {
@@ -338,13 +593,13 @@ export default function Home() {
         setProcessing({ kind: processingKind, progress, message });
 
       if (activeMode === 'merge') await downloadMergedPdf(sources, updateProgress);
-      else if (activeMode === 'split') await downloadSplitZip(selectedSource, pageIndexes, updateProgress);
+      else if (activeMode === 'split') await downloadSplitZip(selectedSource, splitRanges, updateProgress);
       else if (activeMode === 'extract') await downloadExtractedPdf(selectedSource, pageIndexes, updateProgress);
       else await downloadDeletedPdf(selectedSource, pageIndexes, updateProgress);
 
       const successText =
         activeMode === 'merge' ? '병합 PDF를 다운로드했습니다.' :
-        activeMode === 'split' ? '선택한 페이지의 분할 ZIP을 다운로드했습니다.' :
+        activeMode === 'split' ? '구간별 PDF가 담긴 ZIP을 다운로드했습니다.' :
         activeMode === 'extract' ? '선택한 페이지 PDF를 다운로드했습니다.' : '선택한 페이지를 제외한 새 PDF를 다운로드했습니다.';
       showNotice({ tone: 'success', text: successText });
     } catch (error) {
@@ -410,7 +665,7 @@ export default function Home() {
           <div className="feature-strip" aria-label="지원 기능">
             <span><UiIcon name="files" /> PDF 병합</span>
             <span><UiIcon name="extract" /> 페이지 추출</span>
-            <span><UiIcon name="split" /> 페이지 분할</span>
+            <span><UiIcon name="split" /> 구간 분할</span>
             <span><UiIcon name="trash" /> 페이지 삭제</span>
           </div>
         </section>
@@ -420,7 +675,7 @@ export default function Home() {
             <div>
               <p className="editor-kicker"><UiIcon name="shield" /> 모든 작업은 이 기기에서만 처리됩니다</p>
               <h1>어떤 작업을 할까요?</h1>
-              <p>병합은 파일 순서만 정하고, 분할·추출·삭제는 페이지를 직접 골라주세요.</p>
+              <p>병합은 파일 순서를 정하고, 분할·추출·삭제는 페이지 범위를 드래그하세요.</p>
             </div>
             <div className="editor-heading-actions">
               <button className="secondary-button" type="button" disabled={busy} onClick={() => editorFileInputRef.current?.click()}><UiIcon name="plus" /> 파일 추가</button>
@@ -542,31 +797,90 @@ export default function Home() {
                     </span>
                   </label>
                   <div className="selection-actions">
-                    <strong>{selectedPageIndexes.size ? `${selectedPageIndexes.size}페이지 선택됨` : `전체 ${selectedSource?.pageCount ?? 0}페이지`}</strong>
+                    <strong>
+                      {activeMode === 'split'
+                        ? (splitRanges.length ? `${splitRanges.length}개 구간 · ${splitPageCount}페이지` : `전체 ${selectedSource?.pageCount ?? 0}페이지`)
+                        : (selectedPageIndexes.size ? `${selectedPageIndexes.size}페이지 선택됨` : `전체 ${selectedSource?.pageCount ?? 0}페이지`)}
+                    </strong>
                     <button type="button" disabled={busy || !thumbnails.length} onClick={toggleAllPages}>
                       {selectedPageIndexes.size === thumbnails.length && thumbnails.length ? '선택 해제' : '전체 선택'}
                     </button>
                   </div>
                 </div>
 
+                {activeMode === 'split' && (
+                  <section className="split-range-panel" aria-label="분할 구간 목록">
+                    <div className="split-range-heading">
+                      <div>
+                        <strong>분할 구간</strong>
+                        <span>누른 채 끝 페이지까지 드래그하면 구간이 바로 추가돼요.</span>
+                      </div>
+                      <div className="split-range-actions">
+                        <button type="button" disabled={busy || !selectedPageIndexes.size} onClick={addSelectedAsSplitRange}>선택을 구간으로 추가</button>
+                        <button type="button" disabled={busy || !splitRanges.length} onClick={() => setSplitRanges([])}>구간 전체 지우기</button>
+                      </div>
+                    </div>
+                    {splitRanges.length ? (
+                      <ol className="split-range-list">
+                        {splitRanges.map((range, rangeIndex) => (
+                          <li key={`${range.startIndex}-${range.endIndex}`}>
+                            <span><b>구간 {rangeIndex + 1}</b> · {range.startIndex + 1}–{range.endIndex + 1}쪽</span>
+                            <small>{rangePageCount(range)}페이지</small>
+                            <button
+                              type="button"
+                              disabled={busy}
+                              aria-label={`구간 ${rangeIndex + 1}, ${range.startIndex + 1}쪽부터 ${range.endIndex + 1}쪽까지 삭제`}
+                              onClick={() => setSplitRanges((current) => current.filter((item) => item !== range))}
+                            >
+                              <UiIcon name="x" />
+                            </button>
+                          </li>
+                        ))}
+                      </ol>
+                    ) : (
+                      <p className="split-range-empty">아직 지정한 구간이 없어요. 예: 12쪽에서 22쪽까지 드래그</p>
+                    )}
+                  </section>
+                )}
+
                 {thumbnails.length ? (
-                  <div className="page-grid" aria-label={`${selectedSource?.name} 페이지 목록`}>
+                  <div className={`page-grid ${draftRange ? 'is-dragging-range' : ''}`} aria-label={`${selectedSource?.name} 페이지 목록`}>
                     {thumbnails.map((page, displayIndex) => {
-                      const selected = selectedPageIndexes.has(page.pageIndex);
+                      const splitRangeIndex = activeMode === 'split'
+                        ? splitRanges.findIndex((range) => rangeContains(range, page.pageIndex))
+                        : -1;
+                      const inDraftRange = rangeContains(draftRange, page.pageIndex);
+                      const manuallySelected = selectedPageIndexes.has(page.pageIndex);
+                      const selected = activeMode === 'split'
+                        ? splitRangeIndex >= 0 || manuallySelected || inDraftRange
+                        : (inDraftRange ? draftSelecting : manuallySelected);
                       return (
                         <article
                           key={page.pageIndex}
-                          className={`page-card ${selected ? 'is-selected' : ''}`}
+                          data-page-display-index={displayIndex}
+                          className={`page-card ${selected ? 'is-selected' : ''} ${inDraftRange ? 'is-draft-range' : ''} ${inDraftRange && !draftSelecting ? 'is-deselect-range' : ''}`}
                           role="checkbox"
                           aria-checked={selected}
-                          aria-label={`${page.pageNumber}페이지${selected ? ', 선택됨' : ''}`}
+                          aria-label={`${page.pageNumber}페이지${splitRangeIndex >= 0 ? `, 분할 구간 ${splitRangeIndex + 1}` : selected ? ', 선택됨' : ''}`}
                           tabIndex={0}
-                          onClick={(event) => togglePage(displayIndex, event.shiftKey)}
+                          onPointerDown={(event) => handlePagePointerDown(event, displayIndex)}
+                          onPointerMove={handlePagePointerMove}
+                          onPointerUp={(event) => finishPagePointer(event.pointerId)}
+                          onPointerCancel={(event) => finishPagePointer(event.pointerId, true)}
+                          onLostPointerCapture={(event) => finishPagePointer(event.pointerId, true)}
+                          onClick={(event) => {
+                            if (suppressClickRef.current) return;
+                            togglePage(displayIndex, event.shiftKey);
+                          }}
                           onKeyDown={(event) => handlePageKeyDown(event, displayIndex)}
                         >
                           <div className="page-card-top">
                             <span className="page-number">{page.pageNumber}페이지</span>
-                            <span className="selection-check" aria-hidden="true">{selected ? <UiIcon name="check" /> : null}</span>
+                            {splitRangeIndex >= 0 ? (
+                              <span className="range-number-badge" aria-hidden="true">구간 {splitRangeIndex + 1}</span>
+                            ) : (
+                              <span className="selection-check" aria-hidden="true">{selected ? <UiIcon name="check" /> : null}</span>
+                            )}
                           </div>
                           <div className="page-preview" style={{ aspectRatio: `${page.width} / ${page.height}` }}>
                             {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -588,8 +902,19 @@ export default function Home() {
                 )}
 
                 <div className="operation-footer page-operation-footer">
-                  <p><strong>{selectedPageIndexes.size}페이지 선택</strong> · 클릭 또는 Shift 클릭으로 여러 장을 고를 수 있어요</p>
-                  <button className={`download-button ${activeMode === 'delete' ? 'danger-download' : ''}`} type="button" disabled={busy || !selectedPageIndexes.size} onClick={() => void runAction()}><UiIcon name={activeMode === 'delete' ? 'trash' : 'download'} /> {details.button}</button>
+                  {activeMode === 'split' ? (
+                    <p><strong>{splitRanges.length}개 구간 · {splitPageCount}페이지</strong> · 데스크톱은 드래그, 모바일은 길게 누른 뒤 드래그하세요</p>
+                  ) : (
+                    <p><strong>{selectedPageIndexes.size}페이지 선택</strong> · 드래그하면 연속 페이지를 한 번에 선택할 수 있어요</p>
+                  )}
+                  <button
+                    className={`download-button ${activeMode === 'delete' ? 'danger-download' : ''}`}
+                    type="button"
+                    disabled={busy || (activeMode === 'split' ? !splitRanges.length : !selectedPageIndexes.size)}
+                    onClick={() => void runAction()}
+                  >
+                    <UiIcon name={activeMode === 'delete' ? 'trash' : 'download'} /> {details.button}
+                  </button>
                 </div>
               </div>
             )}
