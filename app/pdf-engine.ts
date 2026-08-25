@@ -39,13 +39,14 @@ interface PageReference {
 }
 
 type ProgressHandler = (progress: number, message: string) => void;
+type PdfJsModule = typeof import('pdfjs-dist/legacy/build/pdf.mjs');
 
-let pdfJsModule: typeof import('pdfjs-dist') | null = null;
+let pdfJsModule: PdfJsModule | null = null;
 
 async function getPdfJs() {
   if (!pdfJsModule) {
-    pdfJsModule = await import('pdfjs-dist');
-    pdfJsModule.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
+    pdfJsModule = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    pdfJsModule.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.js';
   }
   return pdfJsModule;
 }
@@ -62,10 +63,16 @@ function cleanBaseName(name: string) {
   return withoutExtension.replace(/[\\/:*?"<>|]/g, '-').trim() || 'document';
 }
 
-function friendlyPdfError(error: unknown, fileName: string) {
+function friendlyPdfError(error: unknown, fileName: string, phase: 'file' | 'preview' = 'file') {
   const message = error instanceof Error ? `${error.name} ${error.message}` : String(error);
   if (/encrypt|password/i.test(message)) {
     return `${fileName}: 암호로 보호된 PDF는 현재 편집할 수 없습니다.`;
+  }
+  if (
+    phase === 'preview'
+    && /worker|fetch|network|module|import|loading chunk|404|not found|unexpected token/i.test(message)
+  ) {
+    return `${fileName}: 페이지 처리 파일을 불러오지 못했습니다. 회사 네트워크에서 이 사이트의 JavaScript 파일을 허용해 주세요.`;
   }
   return `${fileName}: 손상되었거나 지원하지 않는 PDF입니다.`;
 }
@@ -101,15 +108,15 @@ async function renderThumbnail(pdfPage: unknown) {
 }
 
 export async function renderPdfThumbnails(source: SourceFile, onProgress: ProgressHandler) {
-  const pdfjs = await getPdfJs();
-  let pdf: Awaited<ReturnType<typeof pdfjs.getDocument>['promise']>;
+  let pdf: Awaited<ReturnType<PdfJsModule['getDocument']>['promise']>;
   try {
+    const pdfjs = await getPdfJs();
     const task = pdfjs.getDocument({
       data: new Uint8Array(source.bytes.slice(0)),
     });
     pdf = await task.promise;
   } catch (error) {
-    throw new Error(friendlyPdfError(error, source.name));
+    throw new Error(friendlyPdfError(error, source.name, 'preview'));
   }
 
   const thumbnails: PageThumbnail[] = [];
