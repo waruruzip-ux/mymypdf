@@ -40,10 +40,7 @@ let pdfJsModule: typeof import('pdfjs-dist') | null = null;
 async function getPdfJs() {
   if (!pdfJsModule) {
     pdfJsModule = await import('pdfjs-dist');
-    pdfJsModule.GlobalWorkerOptions.workerSrc = new URL(
-      'pdfjs-dist/build/pdf.worker.min.mjs',
-      import.meta.url,
-    ).toString();
+    pdfJsModule.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
   }
   return pdfJsModule;
 }

@@ -10,7 +10,7 @@
     "build": "vinext build",
     "build:vercel": "next build",
     "start": "vinext start",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern public/pdf.worker.min.mjs"
   },
   "dependencies": {
     "jszip": "^3.10.1",
