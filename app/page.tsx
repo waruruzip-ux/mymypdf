@@ -1,6 +1,6 @@
 'use client';
 
-import { ChangeEvent, DragEvent, FormEvent, useRef, useState } from 'react';
+import { ChangeEvent, DragEvent, KeyboardEvent, useRef, useState } from 'react';
 import {
   downloadDeletedPdf,
   downloadExtractedPdf,
@@ -10,9 +10,9 @@ import {
   inspectPdfFile,
   MAX_TOTAL_BYTES,
   MAX_TOTAL_PAGES,
-  parsePageExpression,
-  parseSplitRanges,
+  PageThumbnail,
   ProcessingState,
+  renderPdfThumbnails,
   SourceFile,
 } from './pdf-engine';
 
@@ -44,9 +44,6 @@ const modeDetails: Record<EditorMode, {
   icon: keyof typeof iconGlyphs;
   title: string;
   description: string;
-  inputLabel?: string;
-  placeholder?: string;
-  example?: string;
   button: string;
 }> = {
   merge: {
@@ -59,32 +56,23 @@ const modeDetails: Record<EditorMode, {
   split: {
     label: '분할',
     icon: 'split',
-    title: '나눌 페이지 범위를 적어주세요',
-    description: '쉼표로 구분한 각 범위가 하나의 PDF가 되어 ZIP으로 저장됩니다.',
-    inputLabel: '나눌 페이지 범위',
-    placeholder: '예: 1-3, 4-6, 7-10',
-    example: '1-3, 4-6처럼 입력하면 두 개의 PDF로 나눠집니다.',
-    button: '분할 ZIP 다운로드',
+    title: '나눌 페이지를 골라주세요',
+    description: '선택한 페이지를 각각 한 장짜리 PDF로 만들어 ZIP으로 저장합니다.',
+    button: '선택 페이지 분할',
   },
   extract: {
     label: '추출',
     icon: 'scissors',
-    title: '필요한 페이지 번호를 적어주세요',
-    description: '입력한 순서대로 페이지만 모아 새 PDF를 만듭니다.',
-    inputLabel: '추출할 페이지',
-    placeholder: '예: 1, 3, 5-7',
-    example: '한 페이지는 3, 여러 페이지는 1, 3, 5-7처럼 입력하세요.',
-    button: '추출 PDF 다운로드',
+    title: '필요한 페이지를 골라주세요',
+    description: '선택한 페이지를 화면 순서대로 모아 하나의 새 PDF를 만듭니다.',
+    button: '선택 페이지 추출',
   },
   delete: {
     label: '삭제',
     icon: 'trash',
-    title: '빼고 싶은 페이지 번호를 적어주세요',
-    description: '원본은 건드리지 않고, 입력한 페이지를 제외한 새 PDF를 만듭니다.',
-    inputLabel: '삭제할 페이지',
-    placeholder: '예: 2, 4-6',
-    example: '입력한 페이지만 제외됩니다. 최소 한 페이지는 남아 있어야 해요.',
-    button: '삭제 후 PDF 다운로드',
+    title: '빼고 싶은 페이지를 골라주세요',
+    description: '원본은 건드리지 않고, 선택한 페이지를 제외한 새 PDF를 만듭니다.',
+    button: '선택 페이지 삭제',
   },
 };
 
@@ -106,7 +94,8 @@ export default function Home() {
   const [sources, setSources] = useState<SourceFile[]>([]);
   const [activeMode, setActiveMode] = useState<EditorMode>('merge');
   const [selectedSourceId, setSelectedSourceId] = useState<string>('');
-  const [pageExpression, setPageExpression] = useState('');
+  const [thumbnails, setThumbnails] = useState<PageThumbnail[]>([]);
+  const [selectedPageIndexes, setSelectedPageIndexes] = useState<Set<number>>(new Set());
   const [processing, setProcessing] = useState<ProcessingState>(idleProcessing);
   const [notice, setNotice] = useState<Notice>(null);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
@@ -114,6 +103,9 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorFileInputRef = useRef<HTMLInputElement>(null);
   const draggedSourceIdRef = useRef<string | null>(null);
+  const lastSelectedIndexRef = useRef<number | null>(null);
+  const thumbnailCacheRef = useRef(new Map<string, PageThumbnail[]>());
+  const thumbnailPromiseCacheRef = useRef(new Map<string, Promise<PageThumbnail[]>>());
 
   const busy = processing.kind !== 'idle';
   const hasWorkspace = sources.length > 0;
@@ -121,6 +113,40 @@ export default function Home() {
   const totalPages = totalPageCount(sources);
   const selectedSource = sources.find((source) => source.id === selectedSourceId) ?? sources[0];
   const details = modeDetails[activeMode];
+
+  async function prepareThumbnails(source: SourceFile) {
+    setSelectedPageIndexes(new Set());
+    lastSelectedIndexRef.current = null;
+    const cached = thumbnailCacheRef.current.get(source.id);
+    if (cached) {
+      setThumbnails(cached);
+      return;
+    }
+
+    setThumbnails([]);
+    setProcessing({ kind: 'loading', progress: 1, message: `${source.name} 페이지를 준비하는 중` });
+    let pending = thumbnailPromiseCacheRef.current.get(source.id);
+    if (!pending) {
+      pending = renderPdfThumbnails(source, (progress, message) => {
+        setProcessing({ kind: 'loading', progress, message });
+      });
+      thumbnailPromiseCacheRef.current.set(source.id, pending);
+    }
+
+    try {
+      const result = await pending;
+      thumbnailCacheRef.current.set(source.id, result);
+      setThumbnails(result);
+    } catch (error) {
+      thumbnailPromiseCacheRef.current.delete(source.id);
+      showNotice({
+        tone: 'error',
+        text: error instanceof Error ? error.message : '페이지 미리보기를 만들지 못했습니다.',
+      });
+    } finally {
+      setProcessing(idleProcessing);
+    }
+  }
 
   function showNotice(next: Notice) {
     setNotice(next);
@@ -185,8 +211,11 @@ export default function Home() {
   function switchMode(mode: EditorMode) {
     if (busy) return;
     setActiveMode(mode);
-    setPageExpression('');
+    setSelectedPageIndexes(new Set());
+    lastSelectedIndexRef.current = null;
     setNotice(null);
+    if (mode === 'merge') setThumbnails([]);
+    else if (selectedSource) void prepareThumbnails(selectedSource);
   }
 
   function moveSource(index: number, offset: number) {
@@ -217,11 +246,16 @@ export default function Home() {
 
   function removeSource(sourceId: string) {
     if (busy) return;
-    setSources((current) => {
-      const next = current.filter((source) => source.id !== sourceId);
-      if (selectedSourceId === sourceId) setSelectedSourceId(next[0]?.id ?? '');
-      return next;
-    });
+    const next = sources.filter((source) => source.id !== sourceId);
+    thumbnailCacheRef.current.delete(sourceId);
+    thumbnailPromiseCacheRef.current.delete(sourceId);
+    setSources(next);
+    if (selectedSource?.id === sourceId) {
+      setSelectedPageIndexes(new Set());
+      setThumbnails([]);
+      setSelectedSourceId(next[0]?.id ?? '');
+      if (activeMode !== 'merge' && next[0]) void prepareThumbnails(next[0]);
+    }
     showNotice({ tone: 'success', text: '작업 목록에서 파일을 뺐습니다. 원본 파일은 그대로예요.' });
   }
 
@@ -230,15 +264,61 @@ export default function Home() {
     setSources([]);
     setActiveMode('merge');
     setSelectedSourceId('');
-    setPageExpression('');
+    setThumbnails([]);
+    setSelectedPageIndexes(new Set());
+    thumbnailCacheRef.current.clear();
+    thumbnailPromiseCacheRef.current.clear();
+    lastSelectedIndexRef.current = null;
     setNotice(null);
   }
 
-  async function runAction(event?: FormEvent) {
-    event?.preventDefault();
+  function togglePage(displayIndex: number, shiftKey: boolean) {
+    const page = thumbnails[displayIndex];
+    if (!page || busy) return;
+    setSelectedPageIndexes((current) => {
+      const next = new Set(current);
+      if (shiftKey && lastSelectedIndexRef.current !== null) {
+        const start = Math.min(displayIndex, lastSelectedIndexRef.current);
+        const end = Math.max(displayIndex, lastSelectedIndexRef.current);
+        const shouldSelect = !current.has(page.pageIndex);
+        for (let index = start; index <= end; index += 1) {
+          if (shouldSelect) next.add(thumbnails[index].pageIndex);
+          else next.delete(thumbnails[index].pageIndex);
+        }
+      } else if (next.has(page.pageIndex)) next.delete(page.pageIndex);
+      else next.add(page.pageIndex);
+      return next;
+    });
+    lastSelectedIndexRef.current = displayIndex;
+  }
+
+  function handlePageKeyDown(event: KeyboardEvent<HTMLElement>, displayIndex: number) {
+    if (event.key === ' ' || event.key === 'Enter') {
+      event.preventDefault();
+      togglePage(displayIndex, event.shiftKey);
+    }
+  }
+
+  function toggleAllPages() {
+    if (busy || !thumbnails.length) return;
+    setSelectedPageIndexes((current) =>
+      current.size === thumbnails.length
+        ? new Set()
+        : new Set(thumbnails.map((page) => page.pageIndex)),
+    );
+    lastSelectedIndexRef.current = null;
+  }
+
+  async function runAction() {
     if (busy) return;
     if (!sources.length) {
       showNotice({ tone: 'error', text: '처리할 PDF를 먼저 추가해 주세요.' });
+      return;
+    }
+
+    const pageIndexes = [...selectedPageIndexes].sort((a, b) => a - b);
+    if (activeMode !== 'merge' && !pageIndexes.length) {
+      showNotice({ tone: 'error', text: `${details.label}할 페이지를 먼저 선택해 주세요.` });
       return;
     }
 
@@ -248,31 +328,24 @@ export default function Home() {
       activeMode === 'extract' ? 'extracting' : 'deleting';
     const startMessage =
       activeMode === 'merge' ? '파일 순서대로 합치는 중' :
-      activeMode === 'split' ? '입력한 범위대로 나누는 중' :
-      activeMode === 'extract' ? '입력한 페이지를 추출하는 중' : '입력한 페이지를 제외하는 중';
+      activeMode === 'split' ? '선택한 페이지를 나누는 중' :
+      activeMode === 'extract' ? '선택한 페이지를 추출하는 중' : '선택한 페이지를 제외하는 중';
 
     try {
-      let pageIndexes: number[] = [];
-      let splitRanges: ReturnType<typeof parseSplitRanges> = [];
-      if (activeMode !== 'merge') {
-        if (!selectedSource) throw new Error('작업할 PDF를 선택해 주세요.');
-        if (activeMode === 'split') splitRanges = parseSplitRanges(pageExpression, selectedSource.pageCount);
-        else pageIndexes = parsePageExpression(pageExpression, selectedSource.pageCount);
-      }
-
+      if (activeMode !== 'merge' && !selectedSource) throw new Error('작업할 PDF를 선택해 주세요.');
       setProcessing({ kind: processingKind, progress: 2, message: startMessage });
       const updateProgress = (progress: number, message: string) =>
         setProcessing({ kind: processingKind, progress, message });
 
       if (activeMode === 'merge') await downloadMergedPdf(sources, updateProgress);
-      else if (activeMode === 'split') await downloadSplitZip(selectedSource, splitRanges, updateProgress);
+      else if (activeMode === 'split') await downloadSplitZip(selectedSource, pageIndexes, updateProgress);
       else if (activeMode === 'extract') await downloadExtractedPdf(selectedSource, pageIndexes, updateProgress);
       else await downloadDeletedPdf(selectedSource, pageIndexes, updateProgress);
 
       const successText =
         activeMode === 'merge' ? '병합 PDF를 다운로드했습니다.' :
-        activeMode === 'split' ? '분할 ZIP을 다운로드했습니다.' :
-        activeMode === 'extract' ? '추출 PDF를 다운로드했습니다.' : '페이지를 제외한 새 PDF를 다운로드했습니다.';
+        activeMode === 'split' ? '선택한 페이지의 분할 ZIP을 다운로드했습니다.' :
+        activeMode === 'extract' ? '선택한 페이지 PDF를 다운로드했습니다.' : '선택한 페이지를 제외한 새 PDF를 다운로드했습니다.';
       showNotice({ tone: 'success', text: successText });
     } catch (error) {
       showNotice({ tone: 'error', text: error instanceof Error ? error.message : '파일을 만드는 중 문제가 발생했습니다.' });
@@ -337,7 +410,7 @@ export default function Home() {
           <div className="feature-strip" aria-label="지원 기능">
             <span><UiIcon name="files" /> PDF 병합</span>
             <span><UiIcon name="extract" /> 페이지 추출</span>
-            <span><UiIcon name="split" /> 범위별 분할</span>
+            <span><UiIcon name="split" /> 페이지 분할</span>
             <span><UiIcon name="trash" /> 페이지 삭제</span>
           </div>
         </section>
@@ -347,7 +420,7 @@ export default function Home() {
             <div>
               <p className="editor-kicker"><UiIcon name="shield" /> 모든 작업은 이 기기에서만 처리됩니다</p>
               <h1>어떤 작업을 할까요?</h1>
-              <p>병합은 파일 순서만 정하고, 나머지는 페이지 번호만 입력하면 됩니다.</p>
+              <p>병합은 파일 순서만 정하고, 분할·추출·삭제는 페이지를 직접 골라주세요.</p>
             </div>
             <div className="editor-heading-actions">
               <button className="secondary-button" type="button" disabled={busy} onClick={() => editorFileInputRef.current?.click()}><UiIcon name="plus" /> 파일 추가</button>
@@ -449,43 +522,76 @@ export default function Home() {
                 </div>
               </div>
             ) : (
-              <form className="range-form" onSubmit={(event) => void runAction(event)}>
-                <label className="field-group">
-                  <span>작업할 PDF</span>
-                  <span className="select-wrap">
-                    <select
-                      value={selectedSource?.id ?? ''}
-                      onChange={(event) => {
-                        setSelectedSourceId(event.target.value);
-                        setPageExpression('');
-                      }}
-                      disabled={busy}
-                    >
-                      {sources.map((source) => <option key={source.id} value={source.id}>{source.name} ({source.pageCount}페이지)</option>)}
-                    </select>
-                  </span>
-                </label>
-                <label className="field-group">
-                  <span>{details.inputLabel}</span>
-                  <input
-                    className="page-expression"
-                    type="text"
-                    inputMode="text"
-                    autoComplete="off"
-                    value={pageExpression}
-                    placeholder={details.placeholder}
-                    disabled={busy}
-                    aria-describedby="page-expression-help"
-                    onChange={(event) => setPageExpression(event.target.value)}
-                  />
-                </label>
-                <p className="input-help" id="page-expression-help"><UiIcon name="check" /> {details.example}</p>
-                <div className="selected-document-summary">
-                  <span className="file-document-icon"><UiIcon name="file" /></span>
-                  <span><strong>{selectedSource?.name}</strong><small>입력 가능 범위: 1-{selectedSource?.pageCount}페이지</small></span>
+              <div className="page-workspace">
+                <div className="page-toolbar">
+                  <label className="document-picker">
+                    <span>작업할 PDF</span>
+                    <span className="select-wrap">
+                      <select
+                        value={selectedSource?.id ?? ''}
+                        onChange={(event) => {
+                          const nextSource = sources.find((source) => source.id === event.target.value);
+                          if (!nextSource) return;
+                          setSelectedSourceId(nextSource.id);
+                          void prepareThumbnails(nextSource);
+                        }}
+                        disabled={busy}
+                      >
+                        {sources.map((source) => <option key={source.id} value={source.id}>{source.name} ({source.pageCount}페이지)</option>)}
+                      </select>
+                    </span>
+                  </label>
+                  <div className="selection-actions">
+                    <strong>{selectedPageIndexes.size ? `${selectedPageIndexes.size}페이지 선택됨` : `전체 ${selectedSource?.pageCount ?? 0}페이지`}</strong>
+                    <button type="button" disabled={busy || !thumbnails.length} onClick={toggleAllPages}>
+                      {selectedPageIndexes.size === thumbnails.length && thumbnails.length ? '선택 해제' : '전체 선택'}
+                    </button>
+                  </div>
                 </div>
-                <button className="download-button range-submit" type="submit" disabled={busy || !pageExpression.trim()}><UiIcon name="download" /> {details.button}</button>
-              </form>
+
+                {thumbnails.length ? (
+                  <div className="page-grid" aria-label={`${selectedSource?.name} 페이지 목록`}>
+                    {thumbnails.map((page, displayIndex) => {
+                      const selected = selectedPageIndexes.has(page.pageIndex);
+                      return (
+                        <article
+                          key={page.pageIndex}
+                          className={`page-card ${selected ? 'is-selected' : ''}`}
+                          role="checkbox"
+                          aria-checked={selected}
+                          aria-label={`${page.pageNumber}페이지${selected ? ', 선택됨' : ''}`}
+                          tabIndex={0}
+                          onClick={(event) => togglePage(displayIndex, event.shiftKey)}
+                          onKeyDown={(event) => handlePageKeyDown(event, displayIndex)}
+                        >
+                          <div className="page-card-top">
+                            <span className="page-number">{page.pageNumber}페이지</span>
+                            <span className="selection-check" aria-hidden="true">{selected ? <UiIcon name="check" /> : null}</span>
+                          </div>
+                          <div className="page-preview" style={{ aspectRatio: `${page.width} / ${page.height}` }}>
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img src={page.dataUrl} alt="" draggable={false} />
+                          </div>
+                          <div className="page-card-footer">
+                            <span>{selectedSource?.name}</span>
+                            <small>{page.rotation ? `${page.rotation}° 회전` : '원본 방향'}</small>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="page-loading-state" aria-live="polite">
+                    <UiIcon name="loading" className={busy ? 'spin' : ''} />
+                    <p>{busy ? '페이지 미리보기를 준비하고 있어요.' : '페이지를 불러오지 못했습니다.'}</p>
+                  </div>
+                )}
+
+                <div className="operation-footer page-operation-footer">
+                  <p><strong>{selectedPageIndexes.size}페이지 선택</strong> · 클릭 또는 Shift 클릭으로 여러 장을 고를 수 있어요</p>
+                  <button className={`download-button ${activeMode === 'delete' ? 'danger-download' : ''}`} type="button" disabled={busy || !selectedPageIndexes.size} onClick={() => void runAction()}><UiIcon name={activeMode === 'delete' ? 'trash' : 'download'} /> {details.button}</button>
+                </div>
+              </div>
             )}
           </section>
 

@@ -18,9 +18,13 @@ export interface ProcessingState {
   message: string;
 }
 
-export interface SplitRange {
-  label: string;
-  pageIndexes: number[];
+export interface PageThumbnail {
+  pageIndex: number;
+  pageNumber: number;
+  width: number;
+  height: number;
+  rotation: number;
+  dataUrl: string;
 }
 
 interface PageReference {
@@ -30,6 +34,19 @@ interface PageReference {
 }
 
 type ProgressHandler = (progress: number, message: string) => void;
+
+let pdfJsModule: typeof import('pdfjs-dist') | null = null;
+
+async function getPdfJs() {
+  if (!pdfJsModule) {
+    pdfJsModule = await import('pdfjs-dist');
+    pdfJsModule.GlobalWorkerOptions.workerSrc = new URL(
+      'pdfjs-dist/build/pdf.worker.min.mjs',
+      import.meta.url,
+    ).toString();
+  }
+  return pdfJsModule;
+}
 
 function createId(prefix: string) {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -49,6 +66,78 @@ function friendlyPdfError(error: unknown, fileName: string) {
     return `${fileName}: 암호로 보호된 PDF는 현재 편집할 수 없습니다.`;
   }
   return `${fileName}: 손상되었거나 지원하지 않는 PDF입니다.`;
+}
+
+async function renderThumbnail(pdfPage: unknown) {
+  const page = pdfPage as {
+    getViewport: (options: { scale: number }) => { width: number; height: number; rotation: number };
+    render: (options: {
+      canvas: HTMLCanvasElement;
+      canvasContext: CanvasRenderingContext2D;
+      viewport: unknown;
+      background: string;
+    }) => { promise: Promise<void> };
+  };
+  const baseViewport = page.getViewport({ scale: 1 });
+  const cssWidth = 220;
+  const scale = Math.min(1.4, cssWidth / Math.max(1, baseViewport.width));
+  const viewport = page.getViewport({ scale });
+  const density = Math.min(1.7, window.devicePixelRatio || 1);
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.floor(viewport.width * density));
+  canvas.height = Math.max(1, Math.floor(viewport.height * density));
+  const context = canvas.getContext('2d', { alpha: false });
+  if (!context) throw new Error('Canvas is unavailable');
+  context.setTransform(density, 0, 0, density, 0, 0);
+  await page.render({ canvas, canvasContext: context, viewport, background: '#ffffff' }).promise;
+  return {
+    dataUrl: canvas.toDataURL('image/jpeg', 0.8),
+    width: Math.round(baseViewport.width),
+    height: Math.round(baseViewport.height),
+    rotation: baseViewport.rotation,
+  };
+}
+
+export async function renderPdfThumbnails(source: SourceFile, onProgress: ProgressHandler) {
+  const pdfjs = await getPdfJs();
+  let pdf: Awaited<ReturnType<typeof pdfjs.getDocument>['promise']>;
+  try {
+    const task = pdfjs.getDocument({
+      data: new Uint8Array(source.bytes.slice(0)),
+    });
+    pdf = await task.promise;
+  } catch (error) {
+    throw new Error(friendlyPdfError(error, source.name));
+  }
+
+  const thumbnails: PageThumbnail[] = [];
+  try {
+    for (let pageIndex = 0; pageIndex < pdf.numPages; pageIndex += 1) {
+      const pdfPage = await pdf.getPage(pageIndex + 1);
+      const thumbnail = await renderThumbnail(pdfPage);
+      thumbnails.push({
+        pageIndex,
+        pageNumber: pageIndex + 1,
+        width: thumbnail.width,
+        height: thumbnail.height,
+        rotation: thumbnail.rotation,
+        dataUrl: thumbnail.dataUrl,
+      });
+      pdfPage.cleanup();
+      onProgress(
+        Math.round(((pageIndex + 1) / pdf.numPages) * 100),
+        `${source.name} ${pageIndex + 1}/${pdf.numPages} 페이지 준비 중`,
+      );
+    }
+  } finally {
+    const disposablePdf = pdf as unknown as {
+      destroy?: () => Promise<void>;
+      cleanup?: () => Promise<void> | void;
+    };
+    if (typeof disposablePdf.destroy === 'function') await disposablePdf.destroy();
+    else if (typeof disposablePdf.cleanup === 'function') await disposablePdf.cleanup();
+  }
+  return thumbnails;
 }
 
 export async function inspectPdfFile(
@@ -81,66 +170,6 @@ export async function inspectPdfFile(
     if (error instanceof Error && error.message.includes('전체 페이지')) throw error;
     throw new Error(friendlyPdfError(error, file.name));
   }
-}
-
-function parseToken(token: string, pageCount: number) {
-  const normalized = token.trim();
-  const match = normalized.match(/^(\d+)(?:\s*-\s*(\d+))?$/);
-  if (!match) {
-    throw new Error(`“${normalized || token}” 형식을 확인해 주세요. 예: 1, 3, 5-7`);
-  }
-
-  const start = Number(match[1]);
-  const end = Number(match[2] ?? match[1]);
-  if (start < 1 || end < 1 || start > pageCount || end > pageCount) {
-    throw new Error(`페이지는 1부터 ${pageCount}까지 입력할 수 있습니다.`);
-  }
-  if (start > end) {
-    throw new Error(`“${normalized}” 범위는 작은 페이지부터 입력해 주세요.`);
-  }
-
-  return Array.from({ length: end - start + 1 }, (_, index) => start + index - 1);
-}
-
-function getTokens(expression: string) {
-  const value = expression.trim();
-  if (!value) throw new Error('페이지 번호나 범위를 입력해 주세요.');
-  const tokens = value.split(',');
-  if (tokens.some((token) => !token.trim())) {
-    throw new Error('쉼표 사이에 페이지 번호나 범위를 입력해 주세요.');
-  }
-  return tokens;
-}
-
-export function parsePageExpression(expression: string, pageCount: number) {
-  const seen = new Set<number>();
-  const pageIndexes: number[] = [];
-  for (const token of getTokens(expression)) {
-    for (const pageIndex of parseToken(token, pageCount)) {
-      if (!seen.has(pageIndex)) {
-        seen.add(pageIndex);
-        pageIndexes.push(pageIndex);
-      }
-    }
-  }
-  return pageIndexes;
-}
-
-export function parseSplitRanges(expression: string, pageCount: number) {
-  const seen = new Set<number>();
-  return getTokens(expression).map((token) => {
-    const pageIndexes = parseToken(token, pageCount);
-    for (const pageIndex of pageIndexes) {
-      if (seen.has(pageIndex)) {
-        throw new Error(`${pageIndex + 1}페이지가 두 범위에 겹쳐 있습니다.`);
-      }
-      seen.add(pageIndex);
-    }
-    return {
-      label: token.trim().replace(/\s+/g, ''),
-      pageIndexes,
-    } satisfies SplitRange;
-  });
 }
 
 async function buildPdf(
@@ -246,24 +275,25 @@ export async function downloadDeletedPdf(
 
 export async function downloadSplitZip(
   source: SourceFile,
-  ranges: SplitRange[],
+  pageIndexes: number[],
   onProgress: ProgressHandler,
 ) {
-  if (!ranges.length) throw new Error('분할할 페이지 범위를 입력해 주세요.');
+  if (!pageIndexes.length) throw new Error('분할할 페이지를 선택해 주세요.');
   const zip = new JSZip();
-  for (let index = 0; index < ranges.length; index += 1) {
-    const range = ranges[index];
+  for (let index = 0; index < pageIndexes.length; index += 1) {
+    const pageIndex = pageIndexes[index];
     const bytes = await buildPdf(
-      referencesFor(source, range.pageIndexes),
+      referencesFor(source, [pageIndex]),
       [source],
-      `${source.name} ${range.label}페이지`,
+      `${source.name} ${pageIndex + 1}페이지`,
       () => undefined,
     );
-    const order = String(index + 1).padStart(2, '0');
-    zip.file(`${order}-${cleanBaseName(source.name)}-p${range.label}.pdf`, bytes);
+    const order = String(index + 1).padStart(3, '0');
+    const original = String(pageIndex + 1).padStart(3, '0');
+    zip.file(`${order}-${cleanBaseName(source.name)}-p${original}.pdf`, bytes);
     onProgress(
-      Math.round(((index + 1) / ranges.length) * 82),
-      `${index + 1}/${ranges.length}개 PDF 만드는 중`,
+      Math.round(((index + 1) / pageIndexes.length) * 82),
+      `${index + 1}/${pageIndexes.length}개 PDF 만드는 중`,
     );
   }
   const blob = await zip.generateAsync(
